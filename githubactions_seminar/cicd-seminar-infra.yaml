@@ -1,0 +1,543 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CICD Seminar - Full infra: VPC, subnets, NAT, RDS, ECS cluster, ALB (Blue/Green TG),
+  ECR repos, IAM roles, S3 artifact bucket, CloudWatch logs.
+Parameters:
+  PhpMyAdminPort:
+    Type: Number
+    Default: 8080
+    Description: PhpMyAdmin port (for EC2 example; not used for ECS)
+  UserNameDate:
+    Type: String
+    Description: "<氏名>-<日付>"
+  GithubUser:
+    Type: String
+    Description: "<GITHUB_USER>"
+
+Resources:
+  ###################
+  # VPC & Subnets
+  ###################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub vpc-${UserNameDate}
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub public-subnet-a-${UserNameDate}
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub public-subnet-c-${UserNameDate}
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub private-a-subnet-${UserNameDate}
+
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub private-c-subnet-${UserNameDate}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub igw-${UserNameDate}
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub "nat-${UserNameDate}" }]
+
+  ###################
+  # Route Tables
+  ###################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub public-rt-${UserNameDate}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub private-rt-${UserNameDate}      
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetCRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTable
+
+  ###################
+  # Security Groups
+  ###################
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "alb-sg-${UserNameDate}" }]
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks (allow from ALB)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags: [{ Key: Name, Value: !Sub "ecs-sg-${UserNameDate}" }]
+
+  PhpMyAdminSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: phpMyAdmin public access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "pma-sg-${UserNameDate}" }]
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref PhpMyAdminSG
+      Tags: [{ Key: Name, Value: !Sub "rds-sg-${UserNameDate}" }]
+
+  ###################
+  # RDS
+  ###################
+  MyRDSParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: mariadb10.11
+      Description: "Seminar settings to avoid SSL and Blocked host issues"
+      Parameters:
+        require_secure_transport: "OFF" # SSLエラーを回避
+        max_connect_errors: "10000"     # ホストブロックを回避
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "RDS private subnets"     
+      SubnetIds: [ !Ref PrivateSubnetA, !Ref PrivateSubnetC ]
+      Tags: [{ Key: Name, Value: !Sub "db-subnetgroup-${UserNameDate}" }]
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "db-${UserNameDate}"
+      Engine: mariadb
+      EngineVersion: "10.11.14"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: root
+      MasterUserPassword: root1234
+      VPCSecurityGroups: [ !Ref RDSSecurityGroup ]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBParameterGroupName: !Ref MyRDSParameterGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1
+      Tags: [{ Key: Name, Value: !Sub "rds-${UserNameDate}" }]
+
+  ###################
+  # CloudWatch Logs
+  ###################
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/task-${UserNameDate}"
+      RetentionInDays: 7
+
+  ###################
+  # ECS Cluster
+  ###################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ecs-cluster-${UserNameDate}
+
+  ###################
+  # ALB & TGs & Listeners
+  ###################  
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "alb-${UserNameDate}"
+      Scheme: internet-facing
+      Subnets: [ !Ref PublicSubnetA, !Ref PublicSubnetC ]
+      SecurityGroups: [ !Ref ALBSecurityGroup ]
+      Tags: [{ Key: Name, Value: !Sub "alb-${UserNameDate}" }]
+
+  PHPBlueTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "php-blue-tg-${UserNameDate}"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      Tags: [{ Key: Name, Value: !Sub "php-blue-tg-${UserNameDate}" }]
+
+  PHPGreenTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "php-green-tg-${UserNameDate}"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      Tags: [{ Key: Name, Value: !Sub "php-green-tg-${UserNameDate}" }]
+
+  # Listener（Blue/Green用）
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PHPBlueTG
+      - ALB
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PHPBlueTG
+
+
+  ALBListenerTest:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Protocol: HTTP
+      Port: 9000
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "200"
+            ContentType: "text/plain"
+            MessageBody: "test ok"
+
+
+  ###################
+  # IAM Roles
+  ###################
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CodeDeployServiceRole-${UserNameDate}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ codedeploy.amazonaws.com ] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "TaskExecutionRole-${UserNameDate}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ ecs-tasks.amazonaws.com ] }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # 1. OIDC IDプロバイダーの設定
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1 # GitHub証明書指紋
+
+  # 2. GitHub Actions用IAMロール
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GitHubActionsRole-${UserNameDate}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GithubUser}/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECS_FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+        - arn:aws:iam::aws:policy/IAMFullAccess
+
+  ###################
+  # ECS Task Definitions (initial templates)
+  ###################
+  TaskDefPhp:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "task-php-${UserNameDate}"
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      RequiresCompatibilities: [ FARGATE ]
+      Cpu: "512"
+      Memory: "1024"
+      ContainerDefinitions:
+        - Name: php
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecr-php-${UserNameDate}:latest"
+          Memory: 512
+          Cpu: 256
+          Essential: true
+          PortMappings: [ { ContainerPort: 80, Protocol: tcp } ]
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt RDSInstance.Endpoint.Address
+            - Name: DB_USER
+              Value: root
+            - Name: DB_PASS
+              Value: root1234
+            - Name: DB_NAME
+              Value: sampledb
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: php
+
+  TaskDefPhpMyAdmin:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "task-phpmyadmin-${UserNameDate}"
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      RequiresCompatibilities: [ FARGATE ]
+      Cpu: "256"
+      Memory: "512"
+      ContainerDefinitions:
+        - Name: phpmyadmin
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecr-phpmyadmin-${UserNameDate}:5.2.1"
+          Memory: 512
+          Cpu: 256
+          Essential: true
+          PortMappings: [ { ContainerPort: 80, Protocol: tcp } ]
+          Environment:
+            - Name: PMA_HOST
+              Value: !GetAtt RDSInstance.Endpoint.Address
+            - Name: PMA_USER
+              Value: root
+            - Name: PMA_PASSWORD
+              Value: root1234
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: phpmyadmin
+
+  ###################
+  # ECS Services
+  # - php service: CODE_DEPLOY (Blue/Green) + attached to PHPBlueTG initially
+  # - phpmyadmin service: public Fargate in public subnets (AssignPublicIp ENABLED)
+  ###################
+  PhpService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTP
+      - PHPBlueTG
+      - PHPGreenTG
+      - ALB
+    Properties:
+      ServiceName: !Sub "php-service-${UserNameDate}"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPhp
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [ !Ref PrivateSubnetA, !Ref PrivateSubnetC ]
+          SecurityGroups: [ !Ref ECSSecurityGroup ]
+          AssignPublicIp: DISABLED
+      DeploymentController:
+        Type: CODE_DEPLOY
+      LoadBalancers:
+        - ContainerName: php
+          ContainerPort: 80
+          TargetGroupArn: !Ref PHPBlueTG
+
+  PhpMyAdminService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "phpmyadmin-service-${UserNameDate}"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPhpMyAdmin
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnetA
+          SecurityGroups:
+            - !Ref PhpMyAdminSG
+          AssignPublicIp: ENABLED
+
+Outputs:
+  RdsEndpoint:
+    Description: RDS Endpoint Address (used for DB_HOST)
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  ArtifactBucket:
+    Description: S3 artifact bucket name
+    Value: !Ref ArtifactBucket
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+  ALBArn:
+    Description: ALB Arn
+    Value: !Ref ALB
+  ALBDNS:
+    Description: ALB DNS name
+    Value: !GetAtt ALB.DNSName
+  PHPBlueTGArn:
+    Description: php blue TG ARN
+    Value: !Ref PHPBlueTG
+  PHPGreenTGArn:
+    Description: php green TG ARN
+    Value: !Ref PHPGreenTG
+  CodeDeployRoleArn:
+    Description: CodeDeploy role ARN
+    Value: !GetAtt CodeDeployRole.Arn
+  TaskExecutionRoleArn:
+    Description: ECS TaskExecution role ARN
+    Value: !GetAtt TaskExecutionRole.Arn
+  PhpServiceName:
+    Description: php ECS service name
+    Value: !Sub "php-service-${UserNameDate}"
+  PhpMyAdminServiceName:
+    Description: phpmyadmin ECS service name
+    Value: !Sub "phpmyadmin-service-${UserNameDate}"
+  GitHubActionsRoleArn:
+    Description: "GitHub Actions Role ARN for OIDC"
+    Value: !GetAtt GitHubActionsRole.Arn    
+  AlbHttpListenerArn:
+    Description: "HTTP listener ARN (port 80)"
+    Value: !Ref ALBListenerHTTP
+  AlbTestListenerArn:
+    Description: "Test listener ARN (port 9000)"
+    Value: !Ref ALBListenerTest
