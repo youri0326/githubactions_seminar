@@ -1,0 +1,45 @@
+{
+  "applicationName": "cicd-aws-codedeploy-php-<氏名>-<日付>",
+  "deploymentGroupName": "cicd-aws-codedeploy-php-group",
+  "serviceRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/CodeDeployServiceRole-<氏名>-<日付>",
+  "deploymentStyle": {
+    "deploymentType": "BLUE_GREEN",
+    "deploymentOption": "WITH_TRAFFIC_CONTROL"
+  },
+  "blueGreenDeploymentConfiguration": {
+    "terminateBlueInstancesOnDeploymentSuccess": {
+      "action": "TERMINATE",
+      "terminationWaitTimeInMinutes": 1
+    },
+    "deploymentReadyOption": {
+      "actionOnTimeout": "CONTINUE_DEPLOYMENT",
+      "waitTimeInMinutes": 0
+    }
+  },  
+  "ecsServices": [
+    {
+      "clusterName": "ecs-cluster-<氏名>-<日付>",
+      "serviceName": "php-service-<氏名>-<日付>"
+    }
+  ],
+  "loadBalancerInfo": {
+    "targetGroupPairInfoList": [
+      {
+        "prodTrafficRoute": {
+          "listenerArns": [
+            "<ALB_HTTP_LISTENER_ARN>"
+          ]
+        },
+        "testTrafficRoute": {
+          "listenerArns": [
+            "<ALB_TEST_LISTENER_ARN>"
+          ]
+        },
+        "targetGroups": [
+          { "name": "php-blue-tg-<氏名>-<日付>" },
+          { "name": "php-green-tg-<氏名>-<日付>" }
+        ]
+      }
+    ]
+  }
+}
